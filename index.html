@@ -469,6 +469,8 @@ function setQuality(q) {
   document.getElementById('qHigh').classList.toggle('active', q === 'high');
 }
 
+let isGenerating = false; // bloqueo global para evitar requests en paralelo
+
 function buildUrl(prompt, seed) {
   const style = document.getElementById('styleSelect').value;
   const fullPrompt = style ? `${prompt}, ${style}` : prompt;
@@ -480,12 +482,13 @@ function buildUrl(prompt, seed) {
 }
 
 function regenImage() {
-  if (!lastPrompt) return;
+  if (!lastPrompt || isGenerating) return;
   lastSeed = Math.floor(Math.random() * 999999);
   runGeneration(lastPrompt, lastSeed);
 }
 
 function generateImage() {
+  if (isGenerating) { showToast('⏳ Espera que termine la imagen actual...'); return; }
   const raw = document.getElementById('promptInput').value.trim();
   if (!raw) { shakeInput(); return; }
   lastPrompt = raw;
@@ -494,7 +497,10 @@ function generateImage() {
   runGeneration(raw, lastSeed);
 }
 
-function runGeneration(raw, seed) {
+function runGeneration(raw, seed, retryCount = 0) {
+  if (isGenerating && retryCount === 0) { showToast('⏳ Espera que termine la imagen actual...'); return; }
+  isGenerating = true;
+
   const url = buildUrl(raw, seed);
   lastUrl = url;
 
@@ -513,21 +519,23 @@ function runGeneration(raw, seed) {
   pw.classList.add('show');
   pf.style.width = '0%';
 
-  const totalTime = currentQuality === 'high' ? 28000 : 5000;
+  const totalTime = currentQuality === 'high' ? 28000 : 7000;
   const startTime = Date.now();
   const msgs = currentQuality === 'high'
     ? ['Invocando poderes máximos...','Mezclando píxeles mágicos...','Pintando los detalles...','Afinando la obra...','Casi lista la obra maestra...']
     : ['Invocando dragones...','Mezclando colores...','Dando vida al arte...','Casi listo...'];
   let mi = 0;
   const lt = document.getElementById('loadingText');
-  lt.textContent = msgs[mi];
+  lt.textContent = retryCount > 0 ? `⏳ Reintentando (${retryCount}/3)...` : msgs[mi];
   const iv = setInterval(() => {
     mi = (mi + 1) % msgs.length;
-    lt.textContent = msgs[mi];
+    if (retryCount === 0) lt.textContent = msgs[mi];
     const elapsed = Date.now() - startTime;
     const prog = Math.min(90, (elapsed / totalTime) * 90);
     pf.style.width = prog + '%';
-    pl.textContent = `Generando... ${Math.round(prog)}%`;
+    pl.textContent = retryCount > 0
+      ? `Esperando cola... reintento ${retryCount}/3`
+      : `Generando... ${Math.round(prog)}%`;
   }, currentQuality === 'high' ? 3000 : 1200);
 
   document.getElementById('resultMeta').innerHTML = `
@@ -536,57 +544,77 @@ function runGeneration(raw, seed) {
     <div class="result-meta-row"><span class="label">Estado</span><span style="color:var(--teal)">⏳ Generando...</span></div>
   `;
 
-  const img = new Image();
-  img.onload = () => {
-    clearInterval(iv);
-    pf.style.width = '100%';
-    pl.textContent = '✔ Imagen lista!';
-    setTimeout(() => pw.classList.remove('show'), 1500);
+  // Usamos fetch para detectar error de cola ANTES de cargar la imagen
+  fetch(url)
+    .then(res => {
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        // Pollinations devolvió JSON de error en vez de imagen
+        return res.json().then(data => { throw { queueError: true, data }; });
+      }
+      // Es una imagen real — convertir a blob y mostrar
+      return res.blob();
+    })
+    .then(blob => {
+      clearInterval(iv);
+      const objectUrl = URL.createObjectURL(blob);
+      pf.style.width = '100%';
+      pl.textContent = '✔ Imagen lista!';
+      setTimeout(() => pw.classList.remove('show'), 1500);
 
-    document.getElementById('resultImg').src = url;
-    document.getElementById('resultImg').style.opacity = '1';
-    document.getElementById('loadingOverlay').classList.add('hidden');
-    document.getElementById('genBtn').disabled = false;
-    document.getElementById('regenBtn').disabled = false;
-    document.getElementById('downloadBtn').href = url;
+      document.getElementById('resultImg').src = objectUrl;
+      document.getElementById('resultImg').style.opacity = '1';
+      document.getElementById('loadingOverlay').classList.add('hidden');
+      isGenerating = false;
+      document.getElementById('genBtn').disabled = false;
+      document.getElementById('regenBtn').disabled = false;
+      document.getElementById('downloadBtn').href = url; // URL original para descarga
 
-    const styleLabel = document.getElementById('styleSelect').options[document.getElementById('styleSelect').selectedIndex].text;
-    document.getElementById('resultMeta').innerHTML = `
-      <div class="result-meta-row"><span class="label">Estilo</span>${styleLabel}</div>
-      <div class="result-meta-row"><span class="label">Semilla</span>${seed}</div>
-      <div class="result-meta-row"><span class="label">Tamaño</span>${document.getElementById('sizeSelect').value}</div>
-      <div class="result-meta-row"><span class="label">Estado</span><span style="color:var(--teal)">✔ Listo!</span></div>
-    `;
+      const styleLabel = document.getElementById('styleSelect').options[document.getElementById('styleSelect').selectedIndex].text;
+      document.getElementById('resultMeta').innerHTML = `
+        <div class="result-meta-row"><span class="label">Estilo</span>${styleLabel}</div>
+        <div class="result-meta-row"><span class="label">Semilla</span>${seed}</div>
+        <div class="result-meta-row"><span class="label">Tamaño</span>${document.getElementById('sizeSelect').value}</div>
+        <div class="result-meta-row"><span class="label">Estado</span><span style="color:var(--teal)">✔ Listo!</span></div>
+      `;
 
-    // Actualizar contadores
-    todayCount++;
-    totalCount++;
-    sessionCount++;
-    localStorage.setItem('dp_todayCount', todayCount);
-    localStorage.setItem('dp_totalCount', totalCount);
-    updateStats();
+      todayCount++; totalCount++; sessionCount++;
+      localStorage.setItem('dp_todayCount', todayCount);
+      localStorage.setItem('dp_totalCount', totalCount);
+      updateStats();
 
-    // Guardar en recientes
-    recentImgs.unshift({ url, prompt: raw });
-    if (recentImgs.length > 16) recentImgs.pop();
-    localStorage.setItem('dp_recentImgs', JSON.stringify(recentImgs));
-    renderRecentGrid();
-    showToast('✔ ¡Imagen generada!');
-  };
-  img.onerror = () => {
-    clearInterval(iv);
-    pw.classList.remove('show');
-    document.getElementById('loadingOverlay').innerHTML = `
-      <div style="text-align:center;padding:1rem">
-        <span style="color:#ff9999;font-size:0.75rem;letter-spacing:0.1em;display:block;margin-bottom:0.8rem;">⚠ Error al generar</span>
-        <span style="color:#a08060;font-size:0.65rem;letter-spacing:0.1em;">Pollinations está ocupado.<br>Intenta de nuevo en unos segundos.</span>
-        <br><br>
-        <button onclick="regenImage()" style="font-family:'Cinzel',serif;font-size:0.6rem;letter-spacing:0.15em;padding:0.5rem 1rem;background:rgba(255,80,0,0.2);border:1px solid rgba(255,140,0,0.4);color:var(--ember);cursor:pointer;clip-path:polygon(5px 0%,100% 0%,calc(100% - 5px) 100%,0% 100%);">🔄 Reintentar</button>
-      </div>`;
-    document.getElementById('genBtn').disabled = false;
-    document.getElementById('regenBtn').disabled = false;
-  };
-  img.src = url;
+      recentImgs.unshift({ url, prompt: raw });
+      if (recentImgs.length > 16) recentImgs.pop();
+      localStorage.setItem('dp_recentImgs', JSON.stringify(recentImgs));
+      renderRecentGrid();
+      showToast('✔ ¡Imagen generada!');
+    })
+    .catch(err => {
+      clearInterval(iv);
+      // Si es error de cola y aún tenemos reintentos disponibles
+      if (err && err.queueError && retryCount < 3) {
+        const waitSecs = (retryCount + 1) * 4; // 4s, 8s, 12s
+        lt.textContent = `⏳ Cola llena, reintentando en ${waitSecs}s...`;
+        pl.textContent = `Esperando ${waitSecs} segundos...`;
+        pf.style.width = '15%';
+        showToast(`⏳ Cola llena, reintentando en ${waitSecs}s...`);
+        isGenerating = false; // liberar para permitir el retry
+        setTimeout(() => runGeneration(raw, seed, retryCount + 1), waitSecs * 1000);
+        return;
+      }
+      // Error definitivo
+      pw.classList.remove('show');
+      isGenerating = false;
+      document.getElementById('loadingOverlay').innerHTML = `
+        <div style="text-align:center;padding:1rem">
+          <span style="color:#ff9999;font-size:0.75rem;letter-spacing:0.1em;display:block;margin-bottom:0.8rem;">⚠ Error al generar</span>
+          <span style="color:#a08060;font-size:0.65rem;letter-spacing:0.1em;">Pollinations está ocupado.<br>Intenta de nuevo en unos segundos.</span>
+          <br><br>
+          <button onclick="regenImage()" style="font-family:'Cinzel',serif;font-size:0.6rem;letter-spacing:0.15em;padding:0.5rem 1rem;background:rgba(255,80,0,0.2);border:1px solid rgba(255,140,0,0.4);color:var(--ember);cursor:pointer;clip-path:polygon(5px 0%,100% 0%,calc(100% - 5px) 100%,0% 100%);">🔄 Reintentar</button>
+        </div>`;
+      document.getElementById('genBtn').disabled = false;
+      document.getElementById('regenBtn').disabled = false;
+    });
 }
 
 function shareCurrentImg() { shareImg(lastUrl); }
